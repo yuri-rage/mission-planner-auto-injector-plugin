@@ -11,7 +11,6 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using log4net;
 using MissionPlanner.Comms;
-using MissionPlanner.GCSViews;
 using MissionPlanner.GCSViews.ConfigurationView;
 using MissionPlanner.Plugin;
 using MissionPlanner.Utilities;
@@ -21,7 +20,7 @@ namespace AutoInjector
     public class AutoInjector : Plugin
     {
         public override string Name => "Auto Injector (RTCM3)";
-        public override string Version => "v0.2.0";
+        public override string Version => "v0.3.0";
         public override string Author => "Yuri Rage";
         public override float loopratehz { get; set; } = 1.0f;
 
@@ -30,7 +29,6 @@ namespace AutoInjector
 
         // --- Cached Reflection ---
         private static readonly Type TInject = typeof(ConfigSerialInjectGPS);
-        private static readonly Type TFlight = typeof(FlightData);
         private static FieldInfo F(Type t, string name, bool isStatic) =>
             t.GetField(name, (isStatic ? BindingFlags.Static : BindingFlags.Instance) | BindingFlags.NonPublic | BindingFlags.Public);
 
@@ -40,8 +38,6 @@ namespace AutoInjector
         private static readonly FieldInfo F_msgseen = F(TInject, "msgseen", true);
         private static readonly FieldInfo F_statusLine3 = F(TInject, "status_line3", true);
         private static readonly FieldInfo F_injectInstance = F(TInject, "Instance", true);
-        private static readonly FieldInfo F_panel1 = F(TFlight, "panel1", false);
-        private static readonly FieldInfo F_autopan = F(TFlight, "CHK_autopan", false);
 
         private static readonly Func<CommsNTRIP.GgaInfo> LiveGgaDelegate = InitLiveGgaDelegate();
         private static Func<CommsNTRIP.GgaInfo> InitLiveGgaDelegate()
@@ -52,11 +48,13 @@ namespace AutoInjector
 
         // --- State ---
         private static ConfigSerialInjectGPS _lastHookedInstance;
-        private static StatusLabel _statusLabel;
+        private static ToolStripControlHost _statusHost;
+        private static StatusWidgetPanel _statusPanel;
+        private static Font _statusFont;
         private static ToolTip _statusToolTip;
-        private static bool _panelDoubleBuffered;
         private static int _lastTotalBytes;
         private static int _zeroRateSeconds;
+        private static int _lastWidth;
         private static string _lastToolTipText;
 
         private static readonly (string Tag, Func<string, bool> Match)[] Constellations =
@@ -77,7 +75,7 @@ namespace AutoInjector
             RunOnUi(async () =>
             {
                 await ConnectToLastConfiguredSource();
-                UpdateFlightDataStatusBar();
+                UpdateStatusBar();
             });
             return true;
         }
@@ -87,7 +85,7 @@ namespace AutoInjector
             RunOnUi(() =>
             {
                 SyncUiInstance();
-                UpdateFlightDataStatusBar();
+                UpdateStatusBar();
             });
             return true;
         }
@@ -96,14 +94,18 @@ namespace AutoInjector
         {
             RunOnUi(() =>
             {
-                if (_statusLabel != null && !_statusLabel.IsDisposed)
+                if (_statusHost != null && !_statusHost.IsDisposed)
                 {
-                    _statusLabel.Parent?.Controls.Remove(_statusLabel);
-                    _statusLabel.Dispose();
-                    _statusLabel = null;
+                    _statusHost.Owner?.Items.Remove(_statusHost);
+                    _statusHost.Dispose();
+                    _statusHost = null;
                 }
+                _statusPanel = null;
                 _statusToolTip?.Dispose();
                 _statusToolTip = null;
+                _statusFont?.Dispose();
+                _statusFont = null;
+                _lastWidth = 0;
             });
             return true;
         }
@@ -212,60 +214,15 @@ namespace AutoInjector
         }
 
         // --- Status Bar Widget ---
-        private void UpdateFlightDataStatusBar()
+        private void UpdateStatusBar()
         {
             try
             {
-                var flightData = FlightData.instance ?? Host.MainForm?.FlightData;
-                if (flightData == null || flightData.IsDisposed || !flightData.Visible) return;
+                var mainMenu = Host?.MainForm?.MainMenu;
+                if (mainMenu == null || mainMenu.IsDisposed) return;
 
-                var panel1 = F_panel1?.GetValue(flightData) as Panel;
-                if (panel1 == null || panel1.IsDisposed) return;
-
-                if (!_panelDoubleBuffered)
-                {
-                    typeof(Panel).GetProperty("DoubleBuffered", BindingFlags.Instance | BindingFlags.NonPublic)
-                        ?.SetValue(panel1, true, null);
-                    _panelDoubleBuffered = true;
-                }
-
-                var autopan = F_autopan?.GetValue(flightData) as CheckBox;
-                var targetLocation = new Point(autopan != null ? autopan.Right + 12 : 395, autopan != null ? autopan.Top : 3);
-                int targetHeight = autopan != null ? autopan.Height : 17;
-
-                if (_statusLabel == null || _statusLabel.IsDisposed || _statusLabel.Parent != panel1)
-                {
-                    _statusLabel = panel1.Controls.OfType<StatusLabel>().FirstOrDefault();
-                    if (_statusLabel == null)
-                    {
-                        _statusLabel = new StatusLabel
-                        {
-                            Name = "lbl_rtcm_status",
-                            AutoSize = false,
-                            Size = new Size(350, targetHeight),
-                            Location = targetLocation,
-                            Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-                            Text = "RTCM3: Initializing...",
-                            BackColor = panel1.BackColor,
-                            ForeColor = Color.Silver,
-                            Cursor = Cursors.Hand,
-                            Font = autopan?.Font ?? new Font(panel1.Font.FontFamily, 8.25f, FontStyle.Regular)
-                        };
-
-                        _statusLabel.Click += (s, e) => { try { new ConfigSerialInjectGPS().Show(); } catch (Exception ex) { Log(ex.ToString()); } };
-                        _statusToolTip = new ToolTip();
-                        panel1.Controls.Add(_statusLabel);
-                        _statusLabel.BringToFront();
-                    }
-                }
-
-                if (autopan != null)
-                {
-                    _statusLabel.Height = autopan.Height;
-                    _statusLabel.Font = autopan.Font;
-                }
-                _statusLabel.BackColor = panel1.BackColor;
-                _statusLabel.Location = targetLocation;
+                EnsureStatusWidget(mainMenu);
+                if (_statusHost == null || _statusHost.IsDisposed || _statusPanel == null || _statusPanel.IsDisposed) return;
 
                 // Query stream metrics
                 bool isPortOpen = F_comPort?.GetValue(null) is ICommsSerial p && p.IsOpen;
@@ -297,35 +254,43 @@ namespace AutoInjector
                     ? GetNtripMountpoint(Settings.Instance["NTRIP_url"])
                     : (portType.StartsWith("COM", StringComparison.OrdinalIgnoreCase) ? $"{portType} ({Settings.Instance["SerialInjectGPS_baud"] ?? "115200"})" : portType);
 
-                string newText;
-                Color newColor;
+                string line1Text;
+                string line2Text;
+                Color primaryColor;
+                Color secondaryColor;
                 string newTooltip;
 
                 if (!isPortOpen || !isThreadRunning)
                 {
-                    newText = "RTCM3: Disconnected";
-                    newColor = Color.Silver;
+                    line1Text = "RTCM3: Disconnected";
+                    line2Text = $"Source: {portType}";
+                    primaryColor = Color.Silver;
+                    secondaryColor = Color.Gray;
                     newTooltip = $"Correction stream is not active.\nLast configured source: {portType}";
                 }
                 else if (totalBytes == 0 || (rate == 0 && (msgseen == null || msgseen.IsEmpty)))
                 {
-                    newText = $"RTCM3: {sourceDisplay} • Connecting...";
-                    newColor = Color.Gold;
+                    line1Text = $"RTCM3: {sourceDisplay}";
+                    line2Text = "Connecting...";
+                    primaryColor = secondaryColor = Color.Gold;
                     newTooltip = $"Source: {sourceDisplay}\nWaiting for incoming RTCM3 packets...";
                 }
                 else if (_zeroRateSeconds >= 3)
                 {
-                    string baseTag = hasBase ? " (Base OK)" : "";
-                    newText = $"RTCM3: {sourceDisplay} • Stalled (0 B/s){baseTag}";
-                    newColor = Color.DarkOrange;
+                    string baseTag = hasBase ? "Base OK" : "No Base";
+                    line1Text = $"RTCM3: {sourceDisplay} • Stalled";
+                    line2Text = $"No data for {_zeroRateSeconds}s • {baseTag}";
+                    primaryColor = secondaryColor = Color.DarkOrange;
                     newTooltip = $"Source: {sourceDisplay}\nWarning: No correction data received in {_zeroRateSeconds}s.";
                 }
                 else
                 {
-                    string baseTag = hasBase ? " (Base OK)" : "";
-                    string constellTag = constellations.Count > 0 ? $" [{string.Join("+", constellations)}]" : "";
-                    newText = $"RTCM3: {sourceDisplay} • {FormatRate(rate)}{baseTag}{constellTag}";
-                    newColor = hasBase ? Color.Lime : Color.SpringGreen;
+                    string baseInfo = hasBase ? "Base OK" : "No Base";
+                    string constellInfo = constellations.Count > 0 ? string.Join("+", constellations) : "---";
+
+                    line1Text = $"RTCM3: {sourceDisplay} • {FormatRate(rate)}";
+                    line2Text = $"{baseInfo} • [{constellInfo}]";
+                    primaryColor = secondaryColor = hasBase ? Color.Lime : Color.SpringGreen;
 
                     var sb = new StringBuilder();
                     sb.AppendLine("RTCM3 Correction Stream:");
@@ -343,18 +308,213 @@ namespace AutoInjector
                 }
 
                 newTooltip = $"{newTooltip}\nClick to open RTK/GPS Inject settings.";
-                _statusLabel.Text = newText;
-                _statusLabel.ForeColor = newColor;
+                _statusPanel.UpdateContent(line1Text, primaryColor, line2Text, secondaryColor);
+
+                var prefSize = _statusPanel.MeasurePreferredSize();
+                int targetWidth = (int)(Math.Ceiling(prefSize.Width / 8.0) * 8);
+                int targetHeight = prefSize.Height;
+
+                if (targetWidth > _lastWidth || targetWidth < _lastWidth - 16 || _statusPanel.Height != targetHeight)
+                {
+                    _lastWidth = targetWidth;
+                    _statusPanel.Size = new Size(targetWidth, targetHeight);
+                    _statusHost.Size = new Size(targetWidth, targetHeight);
+                }
 
                 if (_lastToolTipText != newTooltip)
                 {
                     _lastToolTipText = newTooltip;
-                    _statusToolTip?.SetToolTip(_statusLabel, newTooltip);
+                    _statusToolTip?.SetToolTip(_statusPanel, newTooltip);
                 }
             }
             catch (Exception ex)
             {
                 Log($"Error updating status bar: {ex}");
+            }
+        }
+
+        private void EnsureStatusWidget(MenuStrip mainMenu)
+        {
+            if (mainMenu == null || mainMenu.IsDisposed) return;
+
+            // Remove any stale host from a previous plugin instance
+            var oldItem = mainMenu.Items["lbl_rtcm_status"];
+            if (oldItem != null && oldItem != _statusHost)
+            {
+                mainMenu.Items.Remove(oldItem);
+                oldItem.Dispose();
+            }
+
+            if (_statusFont == null)
+            {
+                _statusFont = new Font(mainMenu.Font?.FontFamily ?? FontFamily.GenericSansSerif, 8F, FontStyle.Regular);
+            }
+
+            if (_statusHost == null || _statusHost.IsDisposed || _statusPanel == null || _statusPanel.IsDisposed)
+            {
+                _statusPanel = new StatusWidgetPanel
+                {
+                    Name = "pnl_rtcm_status",
+                    Font = _statusFont
+                };
+                _statusPanel.UpdateContent("RTCM3: Initializing...", Color.Silver, "Connecting...", Color.Gray);
+
+                var initSize = _statusPanel.MeasurePreferredSize();
+                int initWidth = (int)(Math.Ceiling(initSize.Width / 8.0) * 8);
+                _statusPanel.Size = new Size(initWidth, initSize.Height);
+                _lastWidth = initWidth;
+
+                _statusHost = new ToolStripControlHost(_statusPanel)
+                {
+                    Name = "lbl_rtcm_status",
+                    AutoSize = false,
+                    Size = new Size(initWidth, initSize.Height),
+                    Margin = new Padding(8, 0, 0, 0),
+                    BackColor = Color.Transparent
+                };
+
+                _statusPanel.Click += (s, e) =>
+                {
+                    try { new ConfigSerialInjectGPS().Show(); }
+                    catch (Exception ex) { Log(ex.ToString()); }
+                };
+
+                _statusToolTip = new ToolTip();
+            }
+
+            int targetIndex = GetTargetInsertionIndex(mainMenu);
+
+            if (_statusHost.Owner != mainMenu)
+            {
+                _statusHost.Owner?.Items.Remove(_statusHost);
+                mainMenu.Items.Insert(Math.Min(targetIndex, mainMenu.Items.Count), _statusHost);
+            }
+            else
+            {
+                int currentIndex = mainMenu.Items.IndexOf(_statusHost);
+                int expectedIndex = targetIndex > currentIndex ? targetIndex - 1 : targetIndex;
+                if (currentIndex != expectedIndex)
+                {
+                    mainMenu.Items.Remove(_statusHost);
+                    int newTarget = GetTargetInsertionIndex(mainMenu);
+                    mainMenu.Items.Insert(Math.Min(newTarget, mainMenu.Items.Count), _statusHost);
+                }
+            }
+        }
+
+        private static int GetTargetInsertionIndex(MenuStrip mainMenu)
+        {
+            // 1. TitanPlanner: place to the right of the vehicle state control (GPS stats are rightmost inside it)
+            var vehicleState = mainMenu.Items.Cast<ToolStripItem>()
+                .FirstOrDefault(i => i != _statusHost &&
+                                     (i.Name == "toolStripVehicleState" ||
+                                      i.GetType().Name == "ToolStripVehicleState"));
+
+            if (vehicleState != null)
+            {
+                return mainMenu.Items.IndexOf(vehicleState) + 1;
+            }
+
+            // 2. Vanilla MissionPlanner: place right of the top navigation buttons
+            // (after MenuHelp if visible, otherwise after SITL/SIMULATION)
+            var help = mainMenu.Items.Cast<ToolStripItem>()
+                .FirstOrDefault(i => i != _statusHost && i.Name == "MenuHelp") ??
+                mainMenu.Items.Cast<ToolStripItem>()
+                .FirstOrDefault(i => i != _statusHost &&
+                                     (i.Text ?? "").IndexOf("HELP", StringComparison.OrdinalIgnoreCase) >= 0);
+
+            if (help != null && help.Visible)
+            {
+                return mainMenu.Items.IndexOf(help) + 1;
+            }
+
+            var sitl = mainMenu.Items.Cast<ToolStripItem>()
+                .FirstOrDefault(i => i != _statusHost && (i.Name == "MenuSimulation" || i.Name == "MenuSITL")) ??
+                mainMenu.Items.Cast<ToolStripItem>()
+                .FirstOrDefault(i => i != _statusHost &&
+                                     ((i.Text ?? "").IndexOf("SITL", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      (i.Text ?? "").IndexOf("SIMULATION", StringComparison.OrdinalIgnoreCase) >= 0));
+
+            if (sitl != null)
+            {
+                return mainMenu.Items.IndexOf(sitl) + 1;
+            }
+
+            // 3. Fallback: place after the last visible left-aligned item
+            int lastLeftIdx = -1;
+            for (int i = 0; i < mainMenu.Items.Count; i++)
+            {
+                var item = mainMenu.Items[i];
+                if (item != _statusHost && item.Alignment == ToolStripItemAlignment.Left && item.Visible)
+                {
+                    lastLeftIdx = i;
+                }
+            }
+
+            return lastLeftIdx >= 0 ? lastLeftIdx + 1 : mainMenu.Items.Count;
+        }
+
+        private class StatusWidgetPanel : Panel
+        {
+            private string _line1 = "";
+            private string _line2 = "";
+            private Color _line1Color = Color.Silver;
+            private Color _line2Color = Color.Gray;
+
+            public StatusWidgetPanel()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.UserPaint |
+                         ControlStyles.SupportsTransparentBackColor |
+                         ControlStyles.ResizeRedraw, true);
+                UpdateStyles();
+                BackColor = Color.Transparent;
+                Cursor = Cursors.Hand;
+            }
+
+            public override Color BackColor
+            {
+                get => Color.Transparent;
+                set => base.BackColor = Color.Transparent;
+            }
+
+            public void UpdateContent(string line1, Color color1, string line2, Color color2)
+            {
+                if (_line1 != line1 || _line1Color != color1 || _line2 != line2 || _line2Color != color2)
+                {
+                    _line1 = line1;
+                    _line1Color = color1;
+                    _line2 = line2;
+                    _line2Color = color2;
+                    Invalidate();
+                }
+            }
+
+            public Size MeasurePreferredSize()
+            {
+                if (Font == null) return new Size(140, 32);
+                int w1 = TextRenderer.MeasureText(_line1, Font).Width;
+                int w2 = TextRenderer.MeasureText(_line2, Font).Width;
+                int w = Math.Max(w1, w2);
+                int h = Math.Max(32, 1 + 2 * Font.Height + 1);
+                return new Size(w, h);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+
+                if (Font == null) return;
+
+                int lineHeight = Font.Height;
+                var rect1 = new Rectangle(0, 1, Width, lineHeight);
+                var rect2 = new Rectangle(0, 1 + lineHeight, Width, lineHeight);
+
+                TextRenderer.DrawText(e.Graphics, _line1 ?? "", Font, rect1, _line1Color,
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(e.Graphics, _line2 ?? "", Font, rect2, _line2Color,
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
             }
         }
 
@@ -379,25 +539,6 @@ namespace AutoInjector
             if (u == null) return Regex.Replace(url ?? "", @":[^@/]+@", ":***@");
             var user = u.UserInfo.Length > 0 ? u.UserInfo.Split(':')[0] + ":***@" : "";
             return $"{u.Scheme}://{user}{u.Authority}{u.PathAndQuery}";
-        }
-
-        private class StatusLabel : Label
-        {
-            public StatusLabel()
-            {
-                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
-                UpdateStyles();
-            }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                using (var brush = new SolidBrush(BackColor))
-                    e.Graphics.FillRectangle(brush, ClientRectangle);
-
-                var textRect = new Rectangle(0, -2, Width, Height);
-                TextRenderer.DrawText(e.Graphics, Text, Font, textRect, ForeColor, BackColor,
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
-            }
         }
     }
 }
