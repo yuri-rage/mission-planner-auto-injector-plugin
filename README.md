@@ -1,11 +1,13 @@
 # Auto Injector Mission Planner Plugin
 
+![screenshot](screenshot.png)
+
 An automated RTK/GPS correction injection plugin for ArduPilot's [Mission Planner](https://ardupilot.org/planner/).
 
 ## Features
 
 - **Automated Connection**: Automatically connects to the last configured RTCM3 stream (NTRIP, Serial/COM, TCP, or UDP) on Mission Planner startup.
-- **Status Bar**: Displays below the map on the Flight Data status bar (next to *Auto Pan* and *Tuning*):
+- **Status Bar**: Displays in the top ribbon/toolbar (to the right of TitanPlanner's GPS stats or MissionPlanner's top navigation buttons):
   - **Stream Metrics**: Displays active mountpoint/port, throughput (KB/s), detected constellations (GPS, GLONASS, Galileo, BeiDou), and base station confirmation (`Base OK`).
   - **Hover Tooltip**: Message counts, throughput, base coordinates, and protocol settings.
   - **Quick Access**: Click the status indicator at any time to open the RTK/GPS Inject configuration window.
